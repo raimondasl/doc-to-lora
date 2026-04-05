@@ -280,14 +280,24 @@ if __name__ == "__main__":
     parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7861)
     parser.add_argument("--share", action="store_true", default=False)
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to pytorch_model.bin checkpoint. If not specified, "
+             "auto-detects the first available checkpoint.",
+    )
     args = parser.parse_args()
 
-    # Auto-load the first available checkpoint at startup
-    checkpoints = get_available_checkpoints()
-    if checkpoints and checkpoints[0] != "No checkpoints found":
-        load_checkpoint(checkpoints[0])
+    checkpoint = args.checkpoint or os.environ.get("D2L_CHECKPOINT")
+    if checkpoint:
+        load_checkpoint(checkpoint)
     else:
-        print("WARNING: No checkpoints found. Place pytorch_model.bin in trained_d2l/")
+        checkpoints = get_available_checkpoints()
+        if checkpoints and checkpoints[0] != "No checkpoints found":
+            load_checkpoint(checkpoints[0])
+        else:
+            print("WARNING: No checkpoints found. Use --checkpoint or place "
+                  "pytorch_model.bin in trained_d2l/")
 
     demo = create_demo()
     demo.launch(
