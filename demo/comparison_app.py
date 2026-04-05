@@ -43,7 +43,6 @@ from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = None
 tokenizer = None
-internalized_context = None
 model_info = {"base_model": "Not loaded", "checkpoint": "Not loaded"}
 
 
@@ -65,7 +64,7 @@ def get_available_checkpoints():
 
 
 def load_checkpoint(checkpoint_path: str):
-    global model, tokenizer, model_info, internalized_context
+    global model, tokenizer, model_info
 
     if not checkpoint_path or checkpoint_path == "No checkpoints found":
         raise ValueError("No valid checkpoint found.")
@@ -90,15 +89,12 @@ def load_checkpoint(checkpoint_path: str):
 
     model_info["base_model"] = base_model_name
     model_info["checkpoint"] = checkpoint_path
-    internalized_context = None
     print(f"Loaded: base_model={base_model_name}, checkpoint={checkpoint_path}")
 
 
 def fetch_url(url: str):
-    global internalized_context
-
     if not url.strip():
-        return "Please enter a URL.", ""
+        return "Please enter a URL.", "", None
 
     try:
         resp = requests.get(url.strip(), timeout=15, headers={
@@ -120,37 +116,29 @@ def fetch_url(url: str):
         if len(text) > 20000:
             text = text[:20000] + "\n\n[Truncated]"
 
-        # Internalize the context
-        model.reset()
-        model.internalize(text)
-        internalized_context = text
-
-        return f"Fetched and internalized {len(text)} characters from {url}", text
+        return f"Fetched {len(text)} characters from {url}", text, text
     except Exception as e:
-        return f"Error fetching URL: {e}", ""
+        return f"Error fetching URL: {e}", "", None
 
 
 def internalize_text(text: str):
-    global internalized_context
-
     if not text.strip():
-        return "No text to internalize."
+        return "No text to internalize.", None
 
     try:
         model.reset()
         model.internalize(text.strip())
-        internalized_context = text.strip()
-        return f"Internalized {len(internalized_context)} characters."
+        return f"Internalized {len(text.strip())} characters.", text.strip()
     except Exception as e:
-        return f"Error internalizing: {e}"
+        return f"Error internalizing: {e}", None
 
 
-def generate_response(chat_history, message: str):
+def generate_response(chat_history, message: str, ctx: str):
     """Generate responses from both base and adapted models."""
     if not message.strip():
         return chat_history, ""
 
-    if internalized_context is None:
+    if not ctx:
         chat_history.append([message, "Please internalize a context first (fetch a URL or paste text)."])
         return chat_history, ""
 
@@ -172,7 +160,7 @@ def generate_response(chat_history, message: str):
     )
 
     # Generate adapted model response (with internalization)
-    model.internalize(internalized_context)
+    model.internalize(ctx)
     with torch.inference_mode(), torch.amp.autocast(str(device)):
         adapted_outputs = model.generate(input_ids=chat_ids, max_new_tokens=512)
     adapted_response = tokenizer.decode(
@@ -249,25 +237,28 @@ def create_demo():
                     send_btn = gr.Button("Send", variant="primary", scale=1)
                 clear_btn = gr.Button("Clear chat", variant="secondary")
 
+        # Hidden state for internalized context text
+        ctx_state = gr.State(value=None)
+
         # Event handlers
         fetch_btn.click(
             fn=fetch_url,
             inputs=[url_input],
-            outputs=[fetch_status, context_preview],
+            outputs=[fetch_status, context_preview, ctx_state],
         )
         internalize_btn.click(
             fn=internalize_text,
             inputs=[context_preview],
-            outputs=[internalize_status],
+            outputs=[internalize_status, ctx_state],
         )
         msg.submit(
             fn=generate_response,
-            inputs=[chatbot, msg],
+            inputs=[chatbot, msg, ctx_state],
             outputs=[chatbot, msg],
         )
         send_btn.click(
             fn=generate_response,
-            inputs=[chatbot, msg],
+            inputs=[chatbot, msg, ctx_state],
             outputs=[chatbot, msg],
         )
         clear_btn.click(fn=lambda: [], outputs=[chatbot])
