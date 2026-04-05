@@ -26,7 +26,7 @@ dependencies = [
     "liger-kernel",
     "tensorboard",
     "flask",
-    "gradio>=4.40.0",
+    "gradio>=5.0.0,<6.0.0",
     "pandas",
     "plotly",
     "rouge-score",

@@ -1,6 +1,33 @@
+import argparse
 import os
 import sys
 from pathlib import Path
+
+# --- Patch gradio_client bool-schema bug (additionalProperties: false) ---
+import gradio_client.utils as _gc_utils
+
+_orig_json_schema_to_python_type = _gc_utils._json_schema_to_python_type
+
+
+def _patched_json_schema_to_python_type(schema, defs=None):
+    if not isinstance(schema, dict):
+        return "Any"
+    return _orig_json_schema_to_python_type(schema, defs)
+
+
+_gc_utils._json_schema_to_python_type = _patched_json_schema_to_python_type
+
+_orig_get_type = _gc_utils.get_type
+
+
+def _patched_get_type(schema):
+    if not isinstance(schema, dict):
+        return "Any"
+    return _orig_get_type(schema)
+
+
+_gc_utils.get_type = _patched_get_type
+# --- End patch ---
 
 import gradio as gr
 import torch
@@ -581,7 +608,6 @@ def create_demo():
 
                 chatbot = gr.Chatbot(
                     label="Conversation",
-                    show_copy_button=True,
                     height=500,
                     elem_id="chatbot",
                     elem_classes="chat-container",
@@ -676,10 +702,15 @@ def create_demo():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--server-name", default="0.0.0.0")
+    parser.add_argument("--server-port", type=int, default=7861)
+    parser.add_argument("--share", action="store_true", default=False)
+    args = parser.parse_args()
+
     demo = create_demo()
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=7861,
-        share=False,
-        debug=True,
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
     )
