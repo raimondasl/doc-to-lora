@@ -279,9 +279,27 @@ def run_repoqa(
         # Mark as internalized so model.generate() uses the base model path
         model.generated_loras = True
 
+    # ---- Long-context baseline: load a separate model with Dynamic RoPE scaling ----
+    rope_scaling_factor = code_context_size / model.base_model.config.max_position_embeddings
+    if rope_scaling_factor > 1.0:
+        from transformers import AutoConfig, AutoModelForCausalLM
+        lc_config = AutoConfig.from_pretrained(model.base_model.name_or_path)
+        lc_config.rope_scaling = {"type": "dynamic", "factor": rope_scaling_factor}
+        lc_model = AutoModelForCausalLM.from_pretrained(
+            model.base_model.name_or_path,
+            config=lc_config,
+            device_map="cuda",
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        lc_model.eval()
+    else:
+        lc_model = None  # context fits natively, no need for a separate model
+
     # ---- Helper: generate a reply for a prompt ----
     @torch.inference_mode()
-    def generate_reply(prompt: str) -> str:
+    def generate_reply(prompt: str, use_model=None) -> str:
+        """Generate a reply. use_model overrides which model to call."""
         chat = [{"role": "user", "content": prompt}]
         input_ids = tokenizer.apply_chat_template(
             chat,
@@ -303,10 +321,10 @@ def run_repoqa(
             gen_kwargs["stop_strings"] = [stop_seq]
             gen_kwargs["tokenizer"] = tokenizer
 
-        # model.generate() handles both baseline (no LoRAs) and single-chunk
-        # internalized cases. For chunked internalize, LoRAs are already applied
-        # to the layers, so we call base_model.generate() directly.
-        if model.generated_loras is True:
+        if use_model is not None:
+            output_ids = use_model.generate(**gen_kwargs)
+        elif model.generated_loras is True:
+            # Chunked internalize: LoRAs already applied to layers
             output_ids = model.base_model.generate(**gen_kwargs)
         else:
             output_ids = model.generate(**gen_kwargs)
@@ -359,6 +377,7 @@ def run_repoqa(
     os.makedirs(base_dir, exist_ok=True)
     baseline_path = os.path.join(base_dir, "d2l_baseline.jsonl")
     d2l_path = os.path.join(base_dir, "d2l_internalized.jsonl")
+    longctx_path = os.path.join(base_dir, "long_context.jsonl")
 
     # Resume support: skip already-completed tasks
     def load_done_ids(path):
@@ -372,18 +391,27 @@ def run_repoqa(
 
     baseline_done = load_done_ids(baseline_path)
     d2l_done = load_done_ids(d2l_path)
+    longctx_done = load_done_ids(longctx_path)
 
     baseline_outputs = []
     d2l_outputs = []
+    longctx_outputs = []
     if os.path.exists(baseline_path):
         with open(baseline_path) as f:
             baseline_outputs = [json.loads(line) for line in f]
     if os.path.exists(d2l_path):
         with open(d2l_path) as f:
             d2l_outputs = [json.loads(line) for line in f]
+    if os.path.exists(longctx_path):
+        with open(longctx_path) as f:
+            longctx_outputs = [json.loads(line) for line in f]
 
     # ---- Run evaluation ----
-    with open(baseline_path, "a") as f_base, open(d2l_path, "a") as f_d2l:
+    with (
+        open(baseline_path, "a") as f_base,
+        open(d2l_path, "a") as f_d2l,
+        open(longctx_path, "a") as f_lc,
+    ):
         for idx, task in enumerate(tasks):
             tid = make_task_id(task["language"], task["repo"], task["name"])
             # Build the prompt from the template
@@ -414,6 +442,15 @@ def run_repoqa(
                 d2l_outputs.append(result_d2l)
                 print(f"  d2l done ({len(reply_d2l)} chars)")
 
+            # --- Long-context run: full prompt with Dynamic RoPE scaling ---
+            if lc_model is not None and tid not in longctx_done:
+                reply_lc = generate_reply(prompt, use_model=lc_model)
+                result_lc = {**task, "output": [reply_lc]}
+                f_lc.write(json.dumps(result_lc) + "\n")
+                f_lc.flush()
+                longctx_outputs.append(result_lc)
+                print(f"  long-context done ({len(reply_lc)} chars)")
+
     # ---- Compute scores ----
     print("\n=== Baseline Scores ===")
     baseline_scores = compute_score("d2l_baseline", dataset, baseline_outputs, False)
@@ -426,6 +463,13 @@ def run_repoqa(
     d2l_score_path = os.path.join(base_dir, "d2l_internalized-SCORES.json")
     with open(d2l_score_path, "w") as f:
         json.dump(d2l_scores, f)
+
+    if longctx_outputs:
+        print("\n=== Long-Context (Dynamic RoPE) Scores ===")
+        lc_scores = compute_score("long_context", dataset, longctx_outputs, False)
+        lc_score_path = os.path.join(base_dir, "long_context-SCORES.json")
+        with open(lc_score_path, "w") as f:
+            json.dump(lc_scores, f)
 
     results_volume.commit()
     print(f"\nResults saved to {base_dir}")
