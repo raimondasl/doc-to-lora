@@ -148,6 +148,9 @@ def run_repoqa(
     code_context_size: int = 16384,
     max_new_tokens: int = 1024,
     max_tasks: int = -1,
+    run_baseline: bool = True,
+    run_d2l: bool = True,
+    run_long_context: bool = True,
 ):
     """Run RepoQA needle-function-retrieval evaluation.
 
@@ -208,7 +211,7 @@ def run_repoqa(
             stop_seq = tail
 
     # Max chunk length for the context encoder (training used 6144)
-    MAX_CTX_CHUNK_LEN = 4096
+    MAX_CTX_CHUNK_LEN = 6144
 
     # ---- Helper: chunked internalize for long contexts ----
     @torch.inference_mode()
@@ -280,21 +283,21 @@ def run_repoqa(
         model.generated_loras = True
 
     # ---- Long-context baseline: load a separate model with Dynamic RoPE scaling ----
-    rope_scaling_factor = code_context_size / model.base_model.config.max_position_embeddings
-    if rope_scaling_factor > 1.0:
-        from transformers import AutoConfig, AutoModelForCausalLM
-        lc_config = AutoConfig.from_pretrained(model.base_model.name_or_path)
-        lc_config.rope_scaling = {"type": "dynamic", "factor": rope_scaling_factor}
-        lc_model = AutoModelForCausalLM.from_pretrained(
-            model.base_model.name_or_path,
-            config=lc_config,
-            device_map="cuda",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
-        lc_model.eval()
-    else:
-        lc_model = None  # context fits natively, no need for a separate model
+    lc_model = None
+    if run_long_context:
+        rope_scaling_factor = code_context_size / model.base_model.config.max_position_embeddings
+        if rope_scaling_factor > 1.0:
+            from transformers import AutoConfig, AutoModelForCausalLM
+            lc_config = AutoConfig.from_pretrained(model.base_model.name_or_path)
+            lc_config.rope_scaling = {"type": "dynamic", "factor": rope_scaling_factor}
+            lc_model = AutoModelForCausalLM.from_pretrained(
+                model.base_model.name_or_path,
+                config=lc_config,
+                device_map="cuda",
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+            )
+            lc_model.eval()
 
     # ---- Helper: generate a reply for a prompt ----
     @torch.inference_mode()
@@ -428,7 +431,7 @@ def run_repoqa(
             print(f"[{idx+1}/{len(tasks)}] {tid}")
 
             # --- Baseline run: no internalization, no context in prompt ---
-            if tid not in baseline_done:
+            if run_baseline and tid not in baseline_done:
                 model.reset()
                 reply_baseline = generate_reply(short_prompt)
                 result_base = {**task, "output": [reply_baseline]}
@@ -438,7 +441,7 @@ def run_repoqa(
                 print(f"  baseline done ({len(reply_baseline)} chars)")
 
             # --- D2L run: context internalized as LoRAs, short prompt ---
-            if tid not in d2l_done:
+            if run_d2l and tid not in d2l_done:
                 model.reset()
                 chunked_internalize(task["code_context"])
                 reply_d2l = generate_reply(short_prompt)
@@ -449,7 +452,7 @@ def run_repoqa(
                 print(f"  d2l done ({len(reply_d2l)} chars)")
 
             # --- Long-context run: full prompt with Dynamic RoPE scaling ---
-            if lc_model is not None and tid not in longctx_done:
+            if run_long_context and lc_model is not None and tid not in longctx_done:
                 reply_lc = generate_reply(full_prompt, use_model=lc_model)
                 result_lc = {**task, "output": [reply_lc]}
                 f_lc.write(json.dumps(result_lc) + "\n")
@@ -458,17 +461,19 @@ def run_repoqa(
                 print(f"  long-context done ({len(reply_lc)} chars)")
 
     # ---- Compute scores ----
-    print("\n=== Baseline Scores ===")
-    baseline_scores = compute_score("d2l_baseline", dataset, baseline_outputs, False)
-    baseline_score_path = os.path.join(base_dir, "d2l_baseline-SCORES.json")
-    with open(baseline_score_path, "w") as f:
-        json.dump(baseline_scores, f)
+    if baseline_outputs:
+        print("\n=== Baseline Scores ===")
+        baseline_scores = compute_score("d2l_baseline", dataset, baseline_outputs, False)
+        baseline_score_path = os.path.join(base_dir, "d2l_baseline-SCORES.json")
+        with open(baseline_score_path, "w") as f:
+            json.dump(baseline_scores, f)
 
-    print("\n=== D2L (Internalized) Scores ===")
-    d2l_scores = compute_score("d2l_internalized", dataset, d2l_outputs, False)
-    d2l_score_path = os.path.join(base_dir, "d2l_internalized-SCORES.json")
-    with open(d2l_score_path, "w") as f:
-        json.dump(d2l_scores, f)
+    if d2l_outputs:
+        print("\n=== D2L (Internalized) Scores ===")
+        d2l_scores = compute_score("d2l_internalized", dataset, d2l_outputs, False)
+        d2l_score_path = os.path.join(base_dir, "d2l_internalized-SCORES.json")
+        with open(d2l_score_path, "w") as f:
+            json.dump(d2l_scores, f)
 
     if longctx_outputs:
         print("\n=== Long-Context (Dynamic RoPE) Scores ===")
