@@ -414,28 +414,34 @@ def run_repoqa(
     ):
         for idx, task in enumerate(tasks):
             tid = make_task_id(task["language"], task["repo"], task["name"])
-            # Build the prompt from the template
-            prompt = ""
+
+            # Full prompt (with code_context) for the long-context baseline
+            full_prompt = ""
             for key in task["template"].split("\n"):
-                prompt += task[key]
+                full_prompt += task[key]
+
+            # Short prompt (no code_context) for baseline and D2L — the context
+            # either isn't available (baseline) or is internalized as LoRA weights
+            # (D2L), so it should not be in the prompt.
+            short_prompt = task["instruction"] + task["description"] + task["instruction"]
 
             print(f"[{idx+1}/{len(tasks)}] {tid}")
 
-            # --- Baseline run: no internalization ---
+            # --- Baseline run: no internalization, no context in prompt ---
             if tid not in baseline_done:
                 model.reset()
-                reply_baseline = generate_reply(prompt)
+                reply_baseline = generate_reply(short_prompt)
                 result_base = {**task, "output": [reply_baseline]}
                 f_base.write(json.dumps(result_base) + "\n")
                 f_base.flush()
                 baseline_outputs.append(result_base)
                 print(f"  baseline done ({len(reply_baseline)} chars)")
 
-            # --- D2L run: internalize the code context ---
+            # --- D2L run: context internalized as LoRAs, short prompt ---
             if tid not in d2l_done:
                 model.reset()
                 chunked_internalize(task["code_context"])
-                reply_d2l = generate_reply(prompt)
+                reply_d2l = generate_reply(short_prompt)
                 result_d2l = {**task, "output": [reply_d2l]}
                 f_d2l.write(json.dumps(result_d2l) + "\n")
                 f_d2l.flush()
@@ -444,7 +450,7 @@ def run_repoqa(
 
             # --- Long-context run: full prompt with Dynamic RoPE scaling ---
             if lc_model is not None and tid not in longctx_done:
-                reply_lc = generate_reply(prompt, use_model=lc_model)
+                reply_lc = generate_reply(full_prompt, use_model=lc_model)
                 result_lc = {**task, "output": [reply_lc]}
                 f_lc.write(json.dumps(result_lc) + "\n")
                 f_lc.flush()
