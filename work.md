@@ -177,3 +177,27 @@ Conclusions
 
   The chunked internalization for 16K contexts needs a rewrite if you want to support longer contexts — the current implementation has 4 critical bugs. But
   even with working single-chunk internalization, the fundamental limitation is that LoRA weight compression loses verbatim detail.
+
+ Do you think that D2L with fixed/rewritten chunk internalization for 16K contexts will produce better results than single 6K chunk D2L internalization?
+
+● Probably not, for several reasons:
+
+  1. The model was never trained on multi-chunk combination. Training used max_packed_ctx_len=6144 — always a single chunk. Even with a bug-free
+  implementation, combining 3-4 chunk LoRAs is out-of-distribution for this model. The combine_lora merger was likely designed for batching multiple documents
+   in training, not for splitting one document across chunks.
+
+  2. More context = more noise in the LoRA, not more signal. The needle function is already present in the 6K context (the token positions in the results
+  confirm this — all needles fall within 0-6000 tokens). Going to 16K adds surrounding code that dilutes the LoRA's representation of the target function.
+  Each chunk's LoRA captures a low-rank summary of ~4-6K tokens, and averaging them further smears the signal.
+
+  3. The bottleneck is LoRA capacity, not context coverage. The 6K single-chunk results show the model understands what function is being asked for (generates
+   semantically plausible code) but can't reproduce it verbatim. That's a fundamental limitation of compressing 6K tokens of code into a few low-rank matrices
+   — there isn't enough capacity for exact retrieval. Adding more context won't fix that; it'll make it worse.
+
+  4. Evidence from the scores. D2L 6K already matches 22/50 at threshold 0.0 with the needle directly in its single chunk. More chunks would only add noise
+  around the same signal.
+
+  Bottom line: Fixing the chunking would bring 16K D2L from 4% up to roughly the same ~44% as 6K (at threshold 0.0), but is unlikely to exceed it. The effort
+  would be better spent either:
+  - Testing D2L on tasks it was actually designed for (QA, summarization — where semantic understanding matters more than verbatim retrieval)
+  - Or accepting that for code retrieval, long-context with RoPE scaling (or a native long-context model) is simply the better approach
