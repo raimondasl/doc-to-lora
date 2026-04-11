@@ -34,7 +34,8 @@ image = (
         "-i https://flashinfer.ai/whl/cu124/torch2.6"
     )
     # RepoQA benchmark and its dependencies
-    .run_commands("pip install repoqa")
+    # Pin tree-sitter to 0.21.x for tree-sitter-languages compatibility
+    .run_commands("pip install tree-sitter==0.21.3 repoqa")
 )
 
 app = modal.App("doc-to-lora", image=image)
@@ -428,4 +429,3 @@ def run_repoqa(
 
     results_volume.commit()
     print(f"\nResults saved to {base_dir}")
-    return {"baseline": baseline_scores, "d2l": d2l_scores}
