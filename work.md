@@ -175,3 +175,315 @@ Probably not, for several reasons:
 **Bottom line:** Fixing the chunking would bring 16K D2L from 4% up to roughly the same ~44% as 6K (at threshold 0.0), but is unlikely to exceed it. The effort would be better spent either:
 - Testing D2L on tasks it was actually designed for (QA, summarization — where semantic understanding matters more than verbatim retrieval)
 - Or accepting that for code retrieval, long-context with RoPE scaling (or a native long-context model) is simply the better approach
+
+
+
+ ---
+  Available Pretrained D2L Models
+
+  There are 4 pretrained checkpoints on https://huggingface.co/SakanaAI/doc-to-lora:
+
+  ┌─────────────────────────────────┬────────────────────────────────────┬───────┬───────────────────────────────┐
+  │           Checkpoint            │             Base Model             │ Steps │             Notes             │
+  ├─────────────────────────────────┼────────────────────────────────────┼───────┼───────────────────────────────┤
+  │ gemma_demo/checkpoint-80000     │ google/gemma-2-2b-it               │ 80K   │ Used in your RepoQA eval      │
+  ├─────────────────────────────────┼────────────────────────────────────┼───────┼───────────────────────────────┤
+  │ gemma_2b_d2l/checkpoint-20000   │ google/gemma-2-2b-it               │ 20K   │ Likely the "paper" checkpoint │
+  ├─────────────────────────────────┼────────────────────────────────────┼───────┼───────────────────────────────┤
+  │ mistral_7b_d2l/checkpoint-20000 │ mistralai/Mistral-7B-Instruct-v0.2 │ 20K   │ Larger base model (7B)        │
+  ├─────────────────────────────────┼────────────────────────────────────┼───────┼───────────────────────────────┤
+  │ qwen_4b_d2l/checkpoint-20000    │ Qwen/Qwen3-4B-Instruct-2507        │ 20K   │ Mid-size (4B)                 │
+  └─────────────────────────────────┴────────────────────────────────────┴───────┴───────────────────────────────┘
+
+  Yes, you should try a different model — the Mistral 7B variant is the most interesting because:
+  - 7B params gives more capacity to both encode context into LoRA and generate from it
+  - Mistral-7B-Instruct has a stronger baseline, so the D2L delta should be more meaningful
+  - It has its own training config already set up in configs/main_exp/mistral/
+
+  Why RepoQA Failed
+
+  RepoQA requires verbatim code reproduction — finding and reproducing an exact function from a haystack. D2L was trained for closed-form QA (SQuAD, DROP, ROPES)
+  where semantic understanding matters, not exact recall. The LoRA compression fundamentally loses verbatim detail — it captures "what the function does" but not
+  "the exact code."
+
+  Benchmarks That Would Actually Work
+
+  D2L's training data and evaluation scripts tell us exactly what it was designed for. The paper's own benchmarks are the right ones:
+
+  1. SQuAD (best fit, highest priority)
+
+  - Short-context extractive QA (passages are ~100-300 tokens, well within 6K)
+  - D2L was literally trained on SQuAD
+  - Metric: F1 score (partial credit for overlap, not exact match)
+  - The eval script already exists: run_eval.py --datasets squad
+  - Paper reports F1 ~0.82 for D2L vs ~0.76 baseline — a clear win
+
+  2. DROP (discrete reasoning)
+
+  - Passages with questions requiring counting, sorting, arithmetic
+  - Also short context, also in D2L's training data
+  - Good for testing whether internalized context supports reasoning
+
+  3. ROPES (binary QA)
+
+  - Yes/no questions from passages
+  - Simpler but still useful as a signal
+
+  4. LongBench QA tasks (for longer contexts)
+
+  - qasper — QA on scientific papers
+  - multifieldqa_en — multi-field QA
+  - 2wikimqa — multi-document QA
+  - These have longer contexts but measure QA, not verbatim retrieval
+
+  5. NIAH Magic Number (synthetic, controlled)
+
+  - "What is the special magic number?" from a context with noise
+  - Already has data generation scripts in scripts/niah/
+  - Can control context length precisely to stay within 6K
+  - Good for a clean, controlled comparison
+
+  Recommended Plan
+
+  The fastest path to seeing D2L work is to run the paper's own eval with the existing run_eval.py:
+
+  # Three-way comparison on SQuAD:
+  # 1. Base model WITH context in prompt (upper bound)
+  WANDB_MODE=disabled uv run run_eval.py --model_name_or_path google/gemma-2-2b-it \
+    --datasets squad --split test --eval_batch_size_gen 1
+
+  # 2. Base model WITHOUT context (lower bound)
+  WANDB_MODE=disabled uv run run_eval.py --model_name_or_path google/gemma-2-2b-it \
+    --datasets squad --split test --eval_batch_size_gen 1 --remove_context
+
+  # 3. D2L internalized context
+  WANDB_MODE=disabled uv run run_eval.py \
+    --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
+    --datasets squad --split test --eval_batch_size_gen 1
+
+  This would give you a clean three-way comparison: no-context baseline < D2L < full-context upper bound, which is the result pattern the paper reports.
+
+  To also try the Mistral 7B model, download it and swap the checkpoint path:
+  uv run huggingface-cli download SakanaAI/doc-to-lora \
+    --local-dir trained_d2l --include "mistral_7b_d2l/*"
+
+  Want me to set up a Modal evaluation script that runs these benchmarks (SQuAD/DROP) with the three-way comparison, similar to what was done for RepoQA? Or would
+  you prefer to run the existing run_eval.py locally/on Modal first?
+
+  -------------------------------
+   Plan: Modal SQuAD/DROP Evaluation Script
+
+ Context
+
+ D2L was evaluated on RepoQA (needle-function-retrieval) which requires verbatim code reproduction — a poor fit for D2L's semantic compression. We need to evaluate
+ on D2L's actual training benchmarks (SQuAD, DROP) where QA F1 measures semantic overlap.
+
+ Approach
+
+ Create scripts/modal_qa_eval.py that calls the existing run_eval() function from ctx_to_lora.eval_utils for three configurations:
+
+ ┌─────────────────────────────┬───────────────────────────────────────┬─────────────────────────────────────────────┐
+ │             Run             │                 What                  │                  Key args                   │
+ ├─────────────────────────────┼───────────────────────────────────────┼─────────────────────────────────────────────┤
+ │ 1. No-context baseline      │ Base gemma-2-2b-it, no context        │ model_name_or_path=..., remove_context=True │
+ ├─────────────────────────────┼───────────────────────────────────────┼─────────────────────────────────────────────┤
+ │ 2. D2L internalized         │ D2L checkpoint, context as LoRA       │ checkpoint_path=...                         │
+ ├─────────────────────────────┼───────────────────────────────────────┼─────────────────────────────────────────────┤
+ │ 3. Full-context upper bound │ Base gemma-2-2b-it, context in prompt │ model_name_or_path=...                      │
+ └─────────────────────────────┴───────────────────────────────────────┴─────────────────────────────────────────────┘
+
+ Why reuse run_eval()?
+
+ It already handles dataset loading, tokenization, chat templates, context chunking, generation, QA F1 scoring, and result saving. The paper's own eval scripts use
+ this exact function.
+
+ Script structure (scripts/modal_qa_eval.py)
+
+ 1. Modal Image: Same base as scripts/modal_eval.py (CUDA 12.4, PyTorch 2.6, flash-attn) but without RepoQA/tree-sitter deps
+ 2. Data prep step: Download SQuAD from HuggingFace (rajpurkar/squad -> data/raw_datasets/squad/), matching install.sh logic. DROP loads directly from HuggingFace
+ Hub so no prep needed.
+ 3. Volumes: Reuse doc-to-lora-models for checkpoints; new doc-to-lora-qa-results for results
+ 4. run_qa_eval() function: Runs run_eval() up to 3 times sequentially, collects results, prints summary table
+
+ Parameters
+
+ --datasets: comma-separated (default "squad,drop")
+ --max-tasks: max samples per dataset (default 500)
+ --checkpoint-name: D2L checkpoint subpath (default "gemma_demo/checkpoint-80000")
+ --split: test or validation (default "test")
+ --run-baseline / --no-run-baseline
+ --run-d2l / --no-run-d2l
+ --run-full-context / --no-run-full-context
+
+ Data dependency
+
+ SQuAD: must be downloaded inside the Modal container via huggingface-cli download rajpurkar/squad --repo-type dataset --local-dir data/raw_datasets/squad (same as
+ install.sh line 11). DROP: loads from ucinlp/drop on HuggingFace Hub directly.
+
+ Output
+
+ - run_eval() saves results to {checkpoint_dir}/eval-results-{step}/ (for D2L) or eval_results/{model}/ (for base model runs)
+ - The script copies result CSVs to the results volume for persistence
+ - Prints a summary table comparing F1 scores across all three runs
+
+ Key files
+
+ ┌─────────────────────────────────────┬────────────────────────────────────────┐
+ │                File                 │                  Role                  │
+ ├─────────────────────────────────────┼────────────────────────────────────────┤
+ │ scripts/modal_qa_eval.py            │ New — the Modal script                 │
+ ├─────────────────────────────────────┼────────────────────────────────────────┤
+ │ scripts/modal_eval.py               │ Reference for Modal image/volume setup │
+ ├─────────────────────────────────────┼────────────────────────────────────────┤
+ │ src/ctx_to_lora/eval_utils.py       │ run_eval() function (lines 1014-1149)  │
+ ├─────────────────────────────────────┼────────────────────────────────────────┤
+ │ src/ctx_to_lora/data/definitions.py │ Dataset definitions, templates         │
+ ├─────────────────────────────────────┼────────────────────────────────────────┤
+ │ install.sh                          │ SQuAD download command (line 11)       │
+ └─────────────────────────────────────┴────────────────────────────────────────┘
+
+ Verification
+
+ # Quick test (10 samples, SQuAD only)
+ modal run scripts/modal_qa_eval.py::run_qa_eval --datasets squad --max-tasks 10
+
+ # Full evaluation
+ modal run scripts/modal_qa_eval.py::run_qa_eval --datasets squad,drop --max-tasks 500
+
+ Expected: no-context F1 < D2L F1 < full-context F1
+
+
+ The fix is:
+
+  1. src/ctx_to_lora/data/processing.py: Added a _DEFAULT_NUM_PROC variable that reads from the D2L_NUM_PROC environment variable (defaults to 16 for backward
+  compatibility). Replaced all 9 hardcoded num_proc=16 (and one num_proc=8) with num_proc=_DEFAULT_NUM_PROC.
+  2. scripts/modal_qa_eval.py: Sets D2L_NUM_PROC=4 before importing the eval code.
+
+  The root cause: HuggingFace datasets .map() and .filter() with num_proc=16 spawn 16 worker processes that share memory via /dev/shm. Modal containers have limited
+  /dev/shm (typically 64MB), so 16 workers exhaust it and deadlock at ~56% through the filter. Setting num_proc=4 avoids this while still being faster than
+  single-process.
+
+
+  SQuAD QA F1 Scores (10 samples)
+
+  ┌────────────────────────────┬───────┬───────────┬────────┐
+  │            Run             │  F1   │ Precision │ Recall │
+  ├────────────────────────────┼───────┼───────────┼────────┤
+  │ No-context baseline        │ 0.335 │ 0.375     │ 0.317  │
+  ├────────────────────────────┼───────┼───────────┼────────┤
+  │ D2L internalized           │ 0.677 │ 0.671     │ 0.717  │
+  ├────────────────────────────┼───────┼───────────┼────────┤
+  │ Full-context (upper bound) │ 0.949 │ 0.980     │ 0.933  │
+  └────────────────────────────┴───────┴───────────┴────────┘
+
+  D2L works exactly as expected on SQuAD. The ordering is clean:
+
+  No-context (0.34) <<< D2L (0.68) <<< Full-context (0.95)
+
+  D2L roughly doubles the no-context baseline F1 and reaches 71% of the full-context upper bound (0.68 / 0.95). This is close to the paper's reported ~83% — the gap
+  is likely due to the tiny sample size (10 tasks). With 500 samples it should converge closer to the paper's numbers.
+
+  This is the exact opposite of the RepoQA result — on SQuAD, D2L clearly adds value by internalizing the passage context as LoRA weights. The model doesn't need to
+  reproduce verbatim text, just understand the passage well enough to answer questions about it.
+
+  Next steps to consider:
+  - Run with --max-tasks 500 for statistically significant results
+  - Add --datasets squad,drop to also evaluate DROP
+
+  Can you estimate how long in GPU time it will take to run 500 tasks?
+
+● From the 10-task run, we can extrapolate:
+
+  ┌─────────────────────┬─────────────────┬──────────┬───────────────────┐
+  │         Run         │ 10-task runtime │ Per task │ 500-task estimate │
+  ├─────────────────────┼─────────────────┼──────────┼───────────────────┤
+  │ No-context baseline │ 5.0s            │ 0.50s    │ ~4 min            │
+  ├─────────────────────┼─────────────────┼──────────┼───────────────────┤
+  │ D2L internalized    │ 8.9s            │ 0.89s    │ ~7.5 min          │
+  ├─────────────────────┼─────────────────┼──────────┼───────────────────┤
+  │ Full-context        │ 5.4s            │ 0.54s    │ ~4.5 min          │
+  ├─────────────────────┼─────────────────┼──────────┼───────────────────┤
+  │ Total               │ 19.3s           │ 1.93s    │ ~16 min           │
+  └─────────────────────┴─────────────────┴──────────┴───────────────────┘
+
+  So roughly 16 minutes of A100 GPU time for all three runs on SQuAD with 500 tasks. Adding DROP would roughly double it to ~32 minutes, since DROP has a similar
+  number of samples and similar passage lengths.
+
+  This is much faster than the RepoQA eval was because SQuAD/DROP passages are short (~100-300 tokens) vs RepoQA's 6K-16K code contexts, and max_new_tokens=256 (vs
+  1024 for RepoQA).
+
+❯ Can you analyze qa_eval_summary.json which has the results of 500 task run for squad and drop
+
+  Read 1 file (ctrl+o to expand)
+
+● Results: 500 tasks, SQuAD + DROP
+
+  Overall QA F1 Scores
+
+  ┌───────┬─────────────────────┬──────────────────┬────────────────────────────┐
+  │       │ No-context baseline │ D2L internalized │ Full-context (upper bound) │
+  ├───────┼─────────────────────┼──────────────────┼────────────────────────────┤
+  │ SQuAD │ 0.187               │ 0.731            │ 0.868                      │
+  ├───────┼─────────────────────┼──────────────────┼────────────────────────────┤
+  │ DROP  │ 0.135               │ 0.247            │ 0.428                      │
+  └───────┴─────────────────────┴──────────────────┴────────────────────────────┘
+
+  D2L as % of full-context upper bound
+
+  ┌───────┬────────────────────┬───────────────────────────────┐
+  │       │ D2L / Full-context │ Absolute lift over no-context │
+  ├───────┼────────────────────┼───────────────────────────────┤
+  │ SQuAD │ 84.2%              │ +0.544 (3.9x the baseline)    │
+  ├───────┼────────────────────┼───────────────────────────────┤
+  │ DROP  │ 57.7%              │ +0.112 (1.8x the baseline)    │
+  └───────┴────────────────────┴───────────────────────────────┘
+
+  Analysis
+
+  SQuAD — D2L works very well:
+  - F1 jumps from 0.187 (no context) to 0.731 (D2L) — nearly 4x improvement
+  - D2L reaches 84% of the full-context upper bound, which matches the paper's reported ~83%
+  - The ordering is clean: 0.19 <<< 0.73 << 0.87
+  - This confirms the 10-task pilot result and is now statistically meaningful at n=500
+
+  DROP — D2L helps, but less dramatically:
+  - F1 goes from 0.135 to 0.247 — an 83% relative improvement, but only +0.11 absolute
+  - D2L reaches only 58% of the full-context upper bound
+  - DROP requires discrete reasoning (counting, sorting, arithmetic) on top of comprehension — the LoRA captures passage content but the base 2B model struggles with
+   the reasoning part
+  - Even full-context only gets 0.428, confirming DROP is just harder for gemma-2-2b-it
+
+  SQuAD F1 by context length (D2L)
+
+  ┌────────────────┬───────┬─────┐
+  │ Context tokens │  F1   │  n  │
+  ├────────────────┼───────┼─────┤
+  │ 0-127          │ 0.757 │ 122 │
+  ├────────────────┼───────┼─────┤
+  │ 128-255        │ 0.744 │ 325 │
+  ├────────────────┼───────┼─────┤
+  │ 256-511        │ 0.604 │ 50  │
+  ├────────────────┼───────┼─────┤
+  │ 512-1023       │ 0.333 │ 3   │
+  └────────────────┴───────┴─────┘
+
+  D2L performs best on shorter contexts and degrades on longer ones — expected since shorter passages compress more faithfully into LoRA weights.
+
+  Runtime
+
+  ┌──────────────┬─────────┬─────────┬──────────┐
+  │     Run      │  SQuAD  │  DROP   │  Total   │
+  ├──────────────┼─────────┼─────────┼──────────┤
+  │ No-context   │ 5.8 min │ 5.8 min │ 11.6 min │
+  ├──────────────┼─────────┼─────────┼──────────┤
+  │ D2L          │ 9.1 min │ 8.9 min │ 18.0 min │
+  ├──────────────┼─────────┼─────────┼──────────┤
+  │ Full-context │ 6.1 min │ 6.3 min │ 12.4 min │
+  ├──────────────┼─────────┼─────────┼──────────┤
+  │ Total        │         │         │ ~42 min  │
+  └──────────────┴─────────┴─────────┴──────────┘
+
+  Bottom line
+
+  D2L demonstrably works on SQuAD — this is a solid benchmark to showcase the pretrained model's capability. The 84% of full-context result closely matches the
+  paper. DROP also shows improvement but is a harder benchmark due to the reasoning demands on the small 2B base model.

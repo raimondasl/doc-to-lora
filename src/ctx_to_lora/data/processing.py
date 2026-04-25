@@ -28,6 +28,11 @@ from ctx_to_lora.data.preprocessing_fn import get_preprocessing_fn
 from ctx_to_lora.data.self_gen_template import QA_PROMPT_TEMPLATE
 from ctx_to_lora.utils import check_is_iterable, concat_list
 
+# Number of workers for dataset .map() / .filter() calls.
+# Override with D2L_NUM_PROC env var (useful in containers where
+# /dev/shm is too small for 16 multiprocessing workers).
+_DEFAULT_NUM_PROC = int(os.environ.get("D2L_NUM_PROC", "16"))
+
 logger = logging.getLogger()
 
 COLS_TO_KEEP_PREPROCESSING = [
@@ -89,7 +94,7 @@ def load_answers(ds_name, split):
 
     ds_kwargs = get_ds_kwargs(ds_name, split)
     ds = load_dataset(**ds_kwargs, trust_remote_code=True)
-    ds = ds.map(extract_ans, num_proc=8, remove_columns=ds.column_names)
+    ds = ds.map(extract_ans, num_proc=_DEFAULT_NUM_PROC, remove_columns=ds.column_names)
     return ds
 
 
@@ -233,12 +238,12 @@ def load_and_process_dataset(
     ds = ds.map(
         get_preprocessing_fn(ds_name, is_eval),
         remove_columns=cols_to_remove,
-        num_proc=16,
+        num_proc=_DEFAULT_NUM_PROC,
     )
     ds = ds.filter(
         filter_none,
         batched=False,
-        num_proc=16,
+        num_proc=_DEFAULT_NUM_PROC,
     )
     if add_negative_prompt and "context" in ds:
         ds = ds.map(
@@ -363,7 +368,7 @@ def get_tokenized_dataset(
 
     if ("train" in split) and is_caching_enabled():
         tokenized_ds = tokenized_ds.shuffle()
-        tokenized_ds.save_to_disk(ds_path, num_proc=16)
+        tokenized_ds.save_to_disk(ds_path, num_proc=_DEFAULT_NUM_PROC)
         # force reload from disk for fingerprint consistency
         tokenized_ds = datasets.load_from_disk(ds_path)
 
@@ -401,7 +406,7 @@ def construct_and_tokenize_ctx_qa(
     # for sft + chat_model, we need to convert the dataset to chat format
     if "input_ids" in ds.column_names and "response_start_end" in ds.column_names:
         # already tokenized dataset (e.g., self-gen qa data)
-        tokenized_ds = ds.map(get_labels_from_input_ids, num_proc=16)
+        tokenized_ds = ds.map(get_labels_from_input_ids, num_proc=_DEFAULT_NUM_PROC)
     else:
         # construct messages from prompts and responses
         # add "messages_list" field
@@ -411,7 +416,7 @@ def construct_and_tokenize_ctx_qa(
                 "add_ctx_to_chat": add_ctx_to_chat,
                 "add_self_distill_template": add_self_distill_template,
             },
-            num_proc=16,
+            num_proc=_DEFAULT_NUM_PROC,
         )
         # add `input_ids`, `attention_mask`, `labels`
         os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -428,7 +433,7 @@ def construct_and_tokenize_ctx_qa(
     )
     tokenized_ds = tokenized_ds.filter(
         lambda x: bool(x["input_ids"]),  # remove empty "input_ids"
-        num_proc=16,
+        num_proc=_DEFAULT_NUM_PROC,
     )
 
     if need_ctx_ids:
@@ -475,7 +480,7 @@ def construct_and_tokenize_ctx_qa(
         tokenized_ds = tokenized_ds.map(
             split_too_long_ctx,
             fn_kwargs=split_ctx_kwargs,
-            num_proc=16,
+            num_proc=_DEFAULT_NUM_PROC,
         )
 
         logging.info(f"Num samples after ctx chunking: {len(tokenized_ds)}")
@@ -494,7 +499,7 @@ def construct_and_tokenize_ctx_qa(
             fn_kwargs=split_qa_kwargs,
             batched=True,
             batch_size=12_500,
-            num_proc=16,
+            num_proc=_DEFAULT_NUM_PROC,
         )
     if "train" not in split:
         # squeeze since we always have one query per sample in eval
