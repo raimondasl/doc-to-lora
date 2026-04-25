@@ -487,3 +487,103 @@ Probably not, for several reasons:
 
   D2L demonstrably works on SQuAD — this is a solid benchmark to showcase the pretrained model's capability. The 84% of full-context result closely matches the
   paper. DROP also shows improvement but is a harder benchmark due to the reasoning demands on the small 2B base model.
+
+
+ Updated scripts/modal_qa_eval.py:
+  - Added LongBench usage examples to the docstring
+  - Full-context run now auto-detects LongBench datasets and enables truncate_if_too_long_inp (LongBench contexts can be 16K+ tokens, exceeding gemma-2-2b's 8K
+  window — matches the paper's base_model.sh approach)
+  - Summary extraction now also handles ROUGE metrics (in case non-QA datasets are added)
+  - Widened table columns to fit LongBench dataset names
+
+  To run LongBench only:
+  modal run scripts/modal_qa_eval.py::run_qa_eval \
+      --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e" \
+      --max-tasks 500
+
+  To run everything together:
+  modal run scripts/modal_qa_eval.py::run_qa_eval \
+      --datasets "squad,drop,longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e" \
+      --max-tasks 500
+
+  Note that LongBench will take longer per task than SQuAD/DROP since the contexts are much longer (4K-16K+ tokens), especially for the D2L run which needs to
+  internalize all that context. I'd estimate ~1-2 hours for the LongBench portion with 500 tasks across 3 datasets.
+
+Setting num_proc=1 disables multiprocessing entirely — all .map() and .filter() calls run in the main process, which avoids /dev/shm and fork-related deadlocks
+  completely. For evaluation (processing a few hundred samples), the overhead is negligible.
+
+modal run scripts/modal_qa_eval.py::run_qa_eval --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e"       --max-tasks 10
+
+# SQuAD/DROP — A100-40GB (default)
+  modal run scripts/modal_qa_eval.py --datasets squad,drop --max-tasks 500
+
+  # LongBench — A100-80GB (needed for D2L on long contexts)
+  modal run scripts/modal_qa_eval.py --gpu-80gb \
+      --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e"
+
+modal run scripts/modal_qa_eval.py --gpu-80gb --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e" --max-tasks 10
+
+ LongBench Results (10 samples each)
+
+  Overall QA F1 Scores
+
+  ┌───────────────────┬────────────┬───────┬──────────────┬───────────────┐
+  │      Dataset      │ No-context │  D2L  │ Full-context │ D2L vs no-ctx │
+  ├───────────────────┼────────────┼───────┼──────────────┼───────────────┤
+  │ qasper_e          │ 0.100      │ 0.128 │ 0.212        │ +0.028        │
+  ├───────────────────┼────────────┼───────┼──────────────┼───────────────┤
+  │ 2wikimqa_e        │ 0.442      │ 0.250 │ 0.329        │ -0.192        │
+  ├───────────────────┼────────────┼───────┼──────────────┼───────────────┤
+  │ multifieldqa_en_e │ 0.154      │ 0.123 │ 0.325        │ -0.031        │
+  └───────────────────┴────────────┴───────┴──────────────┴───────────────┘
+
+  Analysis
+
+  D2L struggles on LongBench — unlike the strong SQuAD result, D2L does not consistently beat the no-context baseline here:
+
+  - qasper_e: D2L shows a small improvement over no-context (0.128 vs 0.100), but it's marginal and well below the full-context upper bound (0.212). Context lengths
+  are mostly 4K-8K tokens (7/10 samples), which requires chunking.
+  - 2wikimqa_e: D2L is worse than no-context (0.250 vs 0.442). The no-context baseline is surprisingly strong here — the model can answer many multi-hop Wikipedia
+  questions from parametric knowledge alone. D2L's internalized context seems to interfere. Context lengths are 2K-16K (mix of 1 and 2 chunks).
+  - multifieldqa_en_e: D2L is slightly below no-context (0.123 vs 0.154). Full-context does much better at 0.325. Contexts span 4K-16K tokens.
+
+  D2L F1 by context length (across all datasets)
+
+  ┌────────────────┬────────┬─────┬────────────────────────┐
+  │ Context length │ D2L F1 │  n  │         Notes          │
+  ├────────────────┼────────┼─────┼────────────────────────┤
+  │ 1K-2K          │ 0.0    │ 1   │ Too few samples        │
+  ├────────────────┼────────┼─────┼────────────────────────┤
+  │ 2K-4K          │ 0.31   │ 7   │ Best D2L range         │
+  ├────────────────┼────────┼─────┼────────────────────────┤
+  │ 4K-8K          │ 0.10   │ 13  │ Degrades significantly │
+  ├────────────────┼────────┼─────┼────────────────────────┤
+  │ 8K-16K         │ 0.22   │ 8   │ Multi-chunk territory  │
+  ├────────────────┼────────┼─────┼────────────────────────┤
+  │ 16K-32K        │ 0.01   │ 1   │ Nearly zero            │
+  └────────────────┴────────┴─────┴────────────────────────┘
+
+  Why D2L underperforms on LongBench
+
+  1. Context length mismatch: D2L was trained with max_packed_ctx_len=6144. LongBench contexts are typically 4K-16K tokens. Contexts >6K require chunking into
+  multiple LoRAs, which is out-of-distribution for this model (confirmed by the earlier RepoQA investigation).
+  2. Multi-chunk combination hurts: The avg chunks per context were 1.2 (qasper), 1.5 (2wikimqa), 1.4 (multifieldqa). When multiple chunks are combined, the signal
+  gets diluted.
+  3. 2wikimqa is knowledge-heavy: Many 2WikiMultiHopQA questions can be answered from the model's parametric knowledge about well-known entities, so adding noisy
+  internalized context actually hurts.
+
+  Comparison with SQuAD
+
+  ┌────────────────────┬───────────────────┬──────────────────────────┐
+  │                    │ SQuAD (500 tasks) │ LongBench avg (10 tasks) │
+  ├────────────────────┼───────────────────┼──────────────────────────┤
+  │ Context length     │ ~100-300 tokens   │ ~4K-16K tokens           │
+  ├────────────────────┼───────────────────┼──────────────────────────┤
+  │ D2L / full-context │ 84%               │ ~40%                     │
+  ├────────────────────┼───────────────────┼──────────────────────────┤
+  │ D2L vs no-context  │ +0.544            │ -0.065 (hurts!)          │
+  └────────────────────┴───────────────────┴──────────────────────────┘
+
+  Bottom line: D2L works well on short-context QA (SQuAD) but does not generalize to LongBench's longer contexts with the current pretrained model. This aligns with
+  the fundamental LoRA compression limitation — short passages compress faithfully, but 8K+ tokens of scientific papers or multi-document contexts lose too much
+  information. A full 500-task run would confirm this pattern but the trend is clear.

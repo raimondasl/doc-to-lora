@@ -1,4 +1,4 @@
-"""Modal script for D2L QA evaluation (SQuAD, DROP).
+"""Modal script for D2L QA evaluation (SQuAD, DROP, LongBench).
 
 Runs a three-way comparison:
   1. No-context baseline  — base model answers without any context
@@ -7,14 +7,28 @@ Runs a three-way comparison:
 
 Usage:
   # Quick test (10 samples, SQuAD only)
-  modal run scripts/modal_qa_eval.py::run_qa_eval --datasets squad --max-tasks 10
+  modal run scripts/modal_qa_eval.py --datasets squad --max-tasks 10
 
-  # Full evaluation
-  modal run scripts/modal_qa_eval.py::run_qa_eval --datasets squad,drop --max-tasks 500
+  # Full evaluation (short-context)
+  modal run scripts/modal_qa_eval.py --datasets squad,drop --max-tasks 500
+
+  # LongBench evaluation (long-context QA)
+  modal run scripts/modal_qa_eval.py \
+      --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e" \
+      --max-tasks 500
+
+  # All benchmarks
+  modal run scripts/modal_qa_eval.py \
+      --datasets "squad,drop,longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e" \
+      --max-tasks 500
 
   # D2L only, different checkpoint
-  modal run scripts/modal_qa_eval.py::run_qa_eval --no-run-baseline --no-run-full-context \
+  modal run scripts/modal_qa_eval.py --no-run-baseline --no-run-full-context \
       --checkpoint-name "gemma_2b_d2l/checkpoint-20000"
+
+  # Use A100-80GB (needed for LongBench D2L due to long context OOM)
+  modal run scripts/modal_qa_eval.py --gpu-80gb \
+      --datasets "longbench/qasper_e,longbench/2wikimqa_e,longbench/multifieldqa_en_e"
 """
 
 import modal
@@ -60,20 +74,21 @@ MODEL_DIR = "/models"
 RESULTS_DIR = "/results"
 
 
-@app.function(
-    gpu="A100",
+_common_kwargs = dict(
     volumes={MODEL_DIR: model_volume, RESULTS_DIR: results_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=86400,
 )
-def run_qa_eval(
-    datasets: str = "squad,drop",
-    max_tasks: int = 500,
-    checkpoint_name: str = "gemma_demo/checkpoint-80000",
-    split: str = "test",
-    run_baseline: bool = True,
-    run_d2l: bool = True,
-    run_full_context: bool = True,
+
+
+def _run_qa_eval_impl(
+    datasets: str,
+    max_tasks: int,
+    checkpoint_name: str,
+    split: str,
+    run_baseline: bool,
+    run_d2l: bool,
+    run_full_context: bool,
 ):
     """Run three-way QA evaluation: no-context vs D2L vs full-context."""
     import json
@@ -84,7 +99,7 @@ def run_qa_eval(
     os.environ["WANDB_MODE"] = "disabled"
     # Limit multiprocessing workers for datasets .map()/.filter() calls.
     # Hardcoded num_proc=16 deadlocks in containers with small /dev/shm.
-    os.environ["D2L_NUM_PROC"] = "4"
+    os.environ["D2L_NUM_PROC"] = "1"
 
     from ctx_to_lora.eval_utils import run_eval
 
@@ -153,6 +168,9 @@ def run_qa_eval(
         print("=" * 60)
         print("RUN 3: Full-context (upper bound)")
         print("=" * 60)
+        # LongBench contexts can exceed gemma-2-2b's 8K window, so truncate
+        # to avoid OOM / garbage output (matches paper's base_model.sh).
+        has_longbench = any("longbench" in d for d in ds_list)
         metrics = run_eval(
             model_name_or_path=base_model,
             datasets=ds_list,
@@ -161,6 +179,7 @@ def run_qa_eval(
             max_test_samples_per_ds=max_tasks,
             max_val_samples_per_ds=max_tasks,
             remove_context=False,
+            truncate_if_too_long_inp=has_longbench,
             generative=True,
         )
         all_results["full_context"] = metrics
@@ -181,6 +200,7 @@ def run_qa_eval(
     # Collect F1 scores per dataset per run.
     # run_eval returns: {"test_squad": {"test_squad_qa_f1_score": 0.82, ...}, ...}
     # With remove_context: {"test_squad_no_context": {"test_squad_no_context_qa_f1_score": ...}}
+    # LongBench QA datasets use qa_f1_score; non-QA would use rougeL.
     summary = {}
     for run_name, metrics in all_results.items():
         if metrics is None:
@@ -189,17 +209,20 @@ def run_qa_eval(
             if not isinstance(metric_dict, dict):
                 continue
             for ds_name in ds_list:
-                if ds_name.replace("/", "_") not in split_key.replace("/", "_"):
+                # Normalize slashes for matching (longbench/qasper_e -> longbench_qasper_e)
+                ds_normalized = ds_name.replace("/", "_")
+                if ds_normalized not in split_key.replace("/", "_"):
                     continue
                 for k, v in metric_dict.items():
-                    if k.endswith("qa_f1_score"):
+                    if k.endswith("qa_f1_score") or k.endswith("rougeL"):
                         if ds_name not in summary:
                             summary[ds_name] = {}
                         summary[ds_name][run_name] = v
                         break
 
     # Print table
-    header = f"{'Dataset':<20}"
+    col_w = max(30, max((len(d) for d in ds_list), default=0) + 2)
+    header = f"{'Dataset':<{col_w}}"
     for run_name in ["no_context", "d2l", "full_context"]:
         if run_name in all_results:
             header += f"{run_labels[run_name]:<25}"
@@ -207,7 +230,7 @@ def run_qa_eval(
     print("-" * len(header))
 
     for ds_name in ds_list:
-        row = f"{ds_name:<20}"
+        row = f"{ds_name:<{col_w}}"
         if ds_name in summary:
             for run_name in ["no_context", "d2l", "full_context"]:
                 if run_name in all_results:
@@ -248,3 +271,41 @@ def run_qa_eval(
         )
     results_volume.commit()
     print(f"\nResults saved to {summary_path}")
+
+
+# Two entry points with different GPU sizes.
+# Modal decorators are static, so we need separate functions.
+@app.function(gpu="A100", **_common_kwargs)
+def _run_qa_eval_40gb(**kwargs):
+    return _run_qa_eval_impl(**kwargs)
+
+
+@app.function(gpu="A100-80GB", **_common_kwargs)
+def _run_qa_eval_80gb(**kwargs):
+    return _run_qa_eval_impl(**kwargs)
+
+
+@app.local_entrypoint()
+def run_qa_eval(
+    datasets: str = "squad,drop",
+    max_tasks: int = 500,
+    checkpoint_name: str = "gemma_demo/checkpoint-80000",
+    split: str = "test",
+    run_baseline: bool = True,
+    run_d2l: bool = True,
+    run_full_context: bool = True,
+    gpu_80gb: bool = False,
+):
+    kwargs = dict(
+        datasets=datasets,
+        max_tasks=max_tasks,
+        checkpoint_name=checkpoint_name,
+        split=split,
+        run_baseline=run_baseline,
+        run_d2l=run_d2l,
+        run_full_context=run_full_context,
+    )
+    if gpu_80gb:
+        _run_qa_eval_80gb.remote(**kwargs)
+    else:
+        _run_qa_eval_40gb.remote(**kwargs)
