@@ -475,3 +475,22 @@ D2L struggles on LongBench — unlike the strong SQuAD result, D2L does not cons
 #### Bottom line
 
 D2L works well on short-context QA (SQuAD) but does not generalize to LongBench's longer contexts with the current pretrained model. This aligns with the fundamental LoRA compression limitation — short passages compress faithfully, but 8K+ tokens of scientific papers or multi-document contexts lose too much information. A full 500-task run would confirm this pattern but the trend is clear.
+
+#### LongBench on other models?
+
+Would it be worthwhile to try LongBench with other D2L pretrained models?
+
+Probably not, for a few reasons:
+
+1. The bottleneck is context length, not model quality. LongBench contexts are 4K-16K tokens, but all D2L checkpoints were trained with max_packed_ctx_len=6144.
+The Mistral 7B and Qwen 4B variants use the same training config — same chunk limit, same perceiver architecture. They'd hit the same multi-chunk degradation.
+2. The Mistral/Qwen checkpoints have fewer training steps (20K vs 80K). The gemma_demo checkpoint at 80K steps is the most trained model available. Less training
+is unlikely to help with long-context generalization.
+3. The 2wikimqa problem is fundamental. D2L's internalized context actively hurts when the base model already knows the answer from parametric knowledge. A
+stronger base model (Mistral 7B) would have more parametric knowledge about Wikipedia entities, likely making this worse.
+
+What would be more worthwhile instead:
+
+- Run the other models on SQuAD/DROP where D2L actually works. That's the interesting comparison — does Mistral 7B D2L get closer to full-context than Gemma 2B's
+84%? Does the stronger base model improve DROP reasoning (which only hit 58%)?
+- Try ROPES — it's in the training data, short context, and hasn't been tested yet. Quick to add: just --datasets squad,drop,ropes.
